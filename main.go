@@ -3,11 +3,11 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/gookit/color"
-	"net/http"
 	"os"
-	"strings"
 	"sync"
+
+	"github.com/gookit/color"
+	"github.com/pimmytrousers/kitphishr/kitphishr"
 )
 
 const MAX_DOWNLOAD_SIZE = 104857600 // 100MB
@@ -28,11 +28,9 @@ func main() {
 
 	flag.Parse()
 
-	client := MakeClient()
+	client := kitphishr.New(to)
 
 	targets := make(chan string)
-	responses := make(chan Response)
-	tosave := make(chan Response)
 
 	// create the output directory, ready to save files to
 	if downloadKits {
@@ -43,108 +41,26 @@ func main() {
 		}
 	}
 
-	// worker group to fetch the urls from targets channel
-	// send the output to responses channel for further processing
-	var wg sync.WaitGroup
-
-	for i := 0; i < concurrency; i++ {
-
-		wg.Add(1)
-
-		go func() {
-
-			defer wg.Done()
-
-			for url := range targets {
-				if verbose {
-					fmt.Printf("Attempting %s\n", url)
-				}
-				res, err := AttemptTarget(client, url)
-				if err != nil {
-					continue
-				}
-
-				responses <- res
-			}
-
-		}()
-
+	// get input either from user or phishtank
+	input, err := kitphishr.GetUserInput()
+	if err != nil {
+		fmt.Printf("There was an error getting URLS from PhishTank.\n")
+		os.Exit(3)
 	}
 
-	// response group
-	// determines if we've found a zip from a url folder
-	// or if we've found an open directory and looks for a zip within
-	var rg sync.WaitGroup
+	// generate targets based on user input
+	urls := kitphishr.GenerateTargets(input)
 
-	for i := 0; i < concurrency/2; i++ {
+	urlWaitGroup := &sync.WaitGroup{}
+	responses := kitphishr.GetURLs(urlWaitGroup, client, concurrency, urls)
 
-		rg.Add(1)
+	processWaitGroup := &sync.WaitGroup{}
+	phishKits := kitphishr.ProcessURLs(processWaitGroup, client, concurrency, responses)
 
-		go func() {
-
-			defer rg.Done()
-
-			for resp := range responses {
-
-				if resp.StatusCode != http.StatusOK {
-					continue
-				}
-
-				requrl := resp.URL
-
-				// if we found a zip from a URL path
-				if strings.HasSuffix(requrl, ".zip") {
-
-					// make sure it's a valid zip
-					if resp.ContentLength > 0 && resp.ContentLength < MAX_DOWNLOAD_SIZE && strings.Contains(resp.ContentType, "zip") {
-
-						if verbose {
-							color.Green.Printf("Zip found from URL folder at %s\n", requrl)
-						} else {
-							fmt.Println(requrl)
-						}
-
-						// download the zip
-						if downloadKits {
-							tosave <- resp
-							continue
-						}
-					}
-				}
-
-				// check if we've found an open dir containing a zip
-				// todo - walk an open dir for zips in other folders
-				href, err := ZipFromDir(resp)
-				if err != nil {
-					continue
-				}
-				if href != "" {
-					hurl := ""
-					if strings.HasSuffix(requrl, "/") {
-						hurl = requrl + href
-					} else {
-						hurl = requrl + "/" + href
-					}
-					if verbose {
-						color.Green.Printf("Zip found from Open Directory at %s\n", hurl)
-					} else {
-						fmt.Println(hurl)
-					}
-					if downloadKits {
-						resp, err := AttemptTarget(client, hurl)
-						if err != nil {
-							if verbose {
-								color.Red.Printf("There was an error downloading %s\n", hurl)
-							}
-							continue
-						}
-						tosave <- resp
-						continue
-					}
-				}
-			}
-		}()
-	}
+	// // send target urls to target channel
+	// for url := range urls {
+	// 	targets <- url
+	// }
 
 	// save group
 	var sg sync.WaitGroup
@@ -156,8 +72,9 @@ func main() {
 
 		go func() {
 			defer sg.Done()
-			for resp := range tosave {
-				filename, err := SaveResponse(resp)
+			for resp := range phishKits {
+				fmt.Println("Writing")
+				filename, err := SaveResponse(defaultOutputDir, resp)
 				if err != nil {
 					if verbose {
 						color.Red.Printf("There was an error saving %s : %s\n", resp.URL, err)
@@ -172,29 +89,13 @@ func main() {
 		}()
 	}
 
-	// get input either from user or phishtank
-	input, err := GetUserInput()
-	if err != nil {
-		fmt.Printf("There was an error getting URLS from PhishTank.\n")
-		os.Exit(3)
-	}
-
-	// generate targets based on user input
-	urls := GenerateTargets(input)
-
-	// send target urls to target channel
-	for url := range urls {
-		targets <- url
-	}
-
-	// netflix and chill.
 	close(targets)
-	wg.Wait()
+	urlWaitGroup.Wait()
 
 	close(responses)
-	rg.Wait()
+	processWaitGroup.Wait()
 
-	close(tosave)
+	close(phishKits)
 	sg.Wait()
 
 }
